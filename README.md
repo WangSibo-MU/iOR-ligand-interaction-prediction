@@ -1,6 +1,6 @@
 ### Insect Odorant Receptor (OR)-Ligand Interaction Prediction Model
 
-This repository implements a comprehensive deep learning framework for predicting interactions between insect olfactory receptors (ORs) and odorant molecules (ligands). The system supports three complementary molecular representation approaches, each with full interpretability analysis capabilities.
+This repository implements a comprehensive deep learning framework for predicting interactions between insect odorant receptors (ORs) and odorant molecules (ligands). The system supports three complementary molecular representation approaches, each with full interpretability analysis capabilities.
 
 
 
