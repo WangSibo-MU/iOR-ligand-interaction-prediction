@@ -1,0 +1,21 @@
+Top 20 Most Correlated Features with Activity:
+fr_COO2: 0.2378
+PEOE_VSA12: 0.1304
+PEOE_VSA13: 0.1288
+SlogP_VSA3: 0.1237
+fr_unbrch_alkane: 0.1234
+PEOE_VSA2: 0.1170
+VSA_EState5: 0.1166
+fr_Al_OH_noTert: 0.1144
+fr_NH2: 0.1089
+MinAbsEStateIndex: 0.1086
+NumUnspecifiedAtomStereoCenters: 0.1053
+EState_VSA7: 0.1041
+fr_nitro: 0.1036
+BCUT2D_MRLOW: 0.1030
+PEOE_VSA4: 0.1003
+NumSaturatedHeterocycles: 0.0988
+fr_lactone: 0.0864
+NumAtomStereoCenters: 0.0820
+VSA_EState9: 0.0792
+PEOE_VSA3: 0.0785
