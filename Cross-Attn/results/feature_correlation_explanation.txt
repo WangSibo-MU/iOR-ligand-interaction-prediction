@@ -1,0 +1,17 @@
+Feature Correlation Explanation
+===============================
+
+This heatmap shows the correlation between different character features.
+Positive values (red) indicate that characters tend to appear together.
+Negative values (blue) indicate that characters tend to exclude each other.
+
+Strongest positive correlation (1.000) between:
+  - '[' (Punctuation) and ']' (Punctuation)
+  - ']' (Punctuation) and '[' (Punctuation)
+  - '(' (Punctuation) and ')' (Punctuation)
+  - ')' (Punctuation) and '(' (Punctuation)
+Strongest negative correlation (-0.750) between:
+  - '(' (Punctuation) and ' ' (Whitespace)
+  - ')' (Punctuation) and ' ' (Whitespace)
+  - ' ' (Whitespace) and '(' (Punctuation)
+  - ' ' (Whitespace) and ')' (Punctuation)

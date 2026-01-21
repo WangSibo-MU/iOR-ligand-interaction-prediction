@@ -1,0 +1,13 @@
+Top 10 Most Variable Features Explanation
+=========================================
+
+1. ']' (Punctuation): Variance = 0.000186
+2. '1' (Digit): Variance = 0.000192
+3. '@' (Punctuation): Variance = 0.000217
+4. '=' (Punctuation): Variance = 0.000232
+5. 'O' (Letter): Variance = 0.000241
+6. '(' (Punctuation): Variance = 0.000255
+7. ')' (Punctuation): Variance = 0.000255
+8. 'c' (Letter): Variance = 0.000610
+9. 'C' (Letter): Variance = 0.002726
+10. ' ' (Whitespace): Variance = 0.015245
