@@ -1,0 +1,14 @@
+{
+  "dataset_type": "independent_external_validation",
+  "num_external_validation": 4,
+  "positive_samples": 4,
+  "negative_samples": 0,
+  "max_protein_len": 480,
+  "actual_max_smiles": 21,
+  "actual_max_protein": 442,
+  "descriptor_count": 66,
+  "descriptor_source_metadata_path": "descriptors/descriptor_metadata.json",
+  "descriptor_source_names_path": "descriptors/selected_descriptor_names_vif.txt",
+  "balance_samples": false,
+  "saved_compat_test_files": true
+}
