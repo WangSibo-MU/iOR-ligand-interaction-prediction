@@ -46,9 +46,19 @@ config = Config()
 
 # ===================== User Configuration Area =====================
 TASK = 'validate'  # 'validate' or 'predict'
-PREDICTION_FILE = 'text.txt'
+PREDICTION_FILE = 'test.txt'
 OUTPUT_FILE = 'predictions.txt'
-LOCAL_SAMPLE_INDICES = [608, 609, 610]
+LOCAL_SAMPLE_INDICES = [0, 1, 2, 3]
+
+# Model output convention. Keep False when ORLigandTransformer already returns
+# sigmoid probabilities; set True only when it returns raw logits.
+MODEL_OUTPUT_IS_LOGIT = False
+
+# Cross-attention aggregation used for ligand-token importance.
+# 'topk_mean' avoids reducing every softmax row to an almost constant 1/L value.
+# Set to 'mean' to reproduce the previous visualization behavior.
+ATTENTION_REDUCTION = 'topk_mean'  # 'topk_mean', 'max', 'l2', or 'mean'
+ATTENTION_TOPK_FRACTION = 0.05
 # =====================================================
 
 RESULTS_DIR = "results"
@@ -64,6 +74,29 @@ def set_chemical_font():
     plt.rcParams['axes.unicode_minus'] = False
 
 set_chemical_font()
+
+def output_to_probability_tensor(output):
+    """Convert model output to probabilities using one explicit convention."""
+    if not torch.is_tensor(output):
+        output = torch.as_tensor(output, dtype=torch.float32, device=device)
+    return torch.sigmoid(output) if MODEL_OUTPUT_IS_LOGIT else output
+
+
+def safe_minmax(values):
+    """Return a stable 0-1 normalization without amplifying a constant vector."""
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return arr
+    finite = np.isfinite(arr)
+    if not finite.all():
+        replacement = float(np.nanmedian(arr[finite])) if finite.any() else 0.0
+        arr = np.where(finite, arr, replacement)
+    vmin = float(arr.min())
+    vmax = float(arr.max())
+    if np.isclose(vmax, vmin):
+        return np.zeros_like(arr)
+    return (arr - vmin) / (vmax - vmin)
+
 
 class CharExplainer:
     @staticmethod
@@ -92,118 +125,227 @@ class CharExplainer:
         return f"Char 0x{char_code:02X}"
 
 class SMILESAttentionExplainer:
+    """Extract and visualize ligand-protein cross-attention robustly.
+
+    The model is not changed. The modifications concern only attention-axis
+    handling, padding removal, SMILES-to-atom mapping, and display scaling.
+    """
+
+    # Atom tokens in ordinary character-level SMILES. Ring-closure digits and
+    # bond symbols are intentionally excluded because they are not atoms.
+    ATOM_TOKEN_PATTERN = re.compile(
+        r'\[[^\]]+\]|Br|Cl|Si|Se|Na|Li|Mg|Al|Ca|Fe|Zn|Cu|Mn|Hg|Pb|Sn|Ag|Au|'
+        r'Pt|Pd|Co|Ni|As|Ba|Bi|Be|Cs|Rb|Sr|Cr|Cd|In|Tl|Sb|Te|Xe|Kr|He|Ne|Ar|'
+        r'[A-Z]|[bcnops]'
+    )
+
     def __init__(self, model, device, smiles_tokenizer, protein_tokenizer):
         self.model = model
         self.device = device
         self.smiles_tokenizer = smiles_tokenizer
         self.protein_tokenizer = protein_tokenizer
         self.model.eval()
-    
+        self.last_attention_metadata = {}
+
+    @staticmethod
+    def _valid_token_count(token_tensor):
+        token_tensor = token_tensor.reshape(-1)
+        count = int((token_tensor != 0).sum().item())
+        return count if count > 0 else int(token_tensor.numel())
+
+    def _orient_attention_matrix(self, attention_weights, smiles_tensor, protein_tensor):
+        """Return a [batch, smiles_token, protein_token] matrix.
+
+        Supports common outputs [B,H,Ls,Lp], [B,Ls,Lp], [H,Ls,Lp] for a
+        single sample, and transposed ligand/protein axes.
+        """
+        att = attention_weights.detach()
+        batch_size = int(smiles_tensor.shape[0])
+        smiles_total = int(smiles_tensor.shape[1])
+        protein_total = int(protein_tensor.shape[1])
+
+        if att.dim() == 4:
+            # Standard multi-head layout: [B, H, Q, K].
+            att = att.mean(dim=1)
+        elif att.dim() == 3:
+            # Distinguish [B,Q,K] from [H,Q,K] for a one-sample call.
+            if att.shape[0] != batch_size and batch_size == 1:
+                att = att.mean(dim=0, keepdim=True)
+        elif att.dim() == 2:
+            att = att.unsqueeze(0)
+        else:
+            raise ValueError(f"Unsupported attention tensor shape: {tuple(att.shape)}")
+
+        if att.dim() != 3:
+            raise ValueError(f"Attention could not be reduced to 3D: {tuple(att.shape)}")
+
+        q_len, k_len = int(att.shape[-2]), int(att.shape[-1])
+        direct_error = abs(q_len - smiles_total) + abs(k_len - protein_total)
+        reverse_error = abs(q_len - protein_total) + abs(k_len - smiles_total)
+        transposed = reverse_error < direct_error
+        if transposed:
+            att = att.transpose(-2, -1)
+
+        self.last_attention_metadata = {
+            'original_shape': tuple(attention_weights.shape),
+            'oriented_shape': tuple(att.shape),
+            'transposed': transposed,
+            'reduction': ATTENTION_REDUCTION,
+        }
+        return att
+
+    @staticmethod
+    def _aggregate_ligand_attention(matrix):
+        """Aggregate each ligand row over non-padding protein positions."""
+        if matrix.ndim != 2 or matrix.shape[1] == 0:
+            return np.zeros(matrix.shape[0] if matrix.ndim else 0, dtype=np.float64)
+
+        matrix = np.asarray(matrix, dtype=np.float64)
+        if ATTENTION_REDUCTION == 'mean':
+            return matrix.mean(axis=1)
+        if ATTENTION_REDUCTION == 'max':
+            return matrix.max(axis=1)
+        if ATTENTION_REDUCTION == 'l2':
+            return np.sqrt(np.mean(np.square(matrix), axis=1))
+        if ATTENTION_REDUCTION == 'topk_mean':
+            fraction = float(np.clip(ATTENTION_TOPK_FRACTION, 1e-6, 1.0))
+            k = max(1, int(np.ceil(matrix.shape[1] * fraction)))
+            topk = np.partition(matrix, matrix.shape[1] - k, axis=1)[:, -k:]
+            return topk.mean(axis=1)
+        raise ValueError(f"Unknown ATTENTION_REDUCTION: {ATTENTION_REDUCTION}")
+
     def extract_attention(self, smiles_tensor, protein_tensor):
         smiles_tensor = smiles_tensor.clone().detach().to(self.device)
         protein_tensor = protein_tensor.clone().detach().to(self.device)
-        
+
         with torch.no_grad():
             output, attention_weights = self.model(smiles_tensor, protein_tensor)
-        
-        if attention_weights is not None:
-            if attention_weights.dim() == 4:
-                avg_attention = attention_weights.mean(dim=1)
-                smiles_attention = avg_attention.mean(dim=2)
-                cross_attention_matrix = avg_attention
-            else:
-                smiles_attention = attention_weights.mean(dim=1)
-                cross_attention_matrix = attention_weights
-            
-            smiles_attention = smiles_attention.squeeze(0)
-            cross_attention_matrix = cross_attention_matrix.squeeze(0)
-            return smiles_attention.cpu().numpy(), cross_attention_matrix.cpu().numpy(), output.item()
-        else:
-            return None, None, output.item()
-    
-    def visualize_smiles_attention(self, smiles_str, attention_weights, output_path, 
-                                 title="SMILES Attention", true_label=None, prediction=None):
-        valid_chars = []
-        valid_attention = []
-        
+
+        prediction = float(output_to_probability_tensor(output).reshape(-1)[0].item())
+        if attention_weights is None:
+            return None, None, prediction
+
+        oriented = self._orient_attention_matrix(
+            attention_weights, smiles_tensor, protein_tensor
+        )
+        smiles_valid = min(
+            self._valid_token_count(smiles_tensor[0]), int(oriented.shape[-2])
+        )
+        protein_valid = min(
+            self._valid_token_count(protein_tensor[0]), int(oriented.shape[-1])
+        )
+
+        matrix = oriented[0, :smiles_valid, :protein_valid].cpu().numpy()
+        smiles_attention = self._aggregate_ligand_attention(matrix)
+        self.last_attention_metadata.update({
+            'valid_smiles_tokens': smiles_valid,
+            'valid_protein_tokens': protein_valid,
+            'raw_score_min': float(smiles_attention.min()) if smiles_attention.size else 0.0,
+            'raw_score_max': float(smiles_attention.max()) if smiles_attention.size else 0.0,
+        })
+        return smiles_attention, matrix, prediction
+
+    @classmethod
+    def _atom_token_spans(cls, smiles_str, mol):
+        spans = [(m.start(), m.end(), m.group(0)) for m in cls.ATOM_TOKEN_PATTERN.finditer(smiles_str)]
+        if len(spans) != mol.GetNumAtoms():
+            raise ValueError(
+                f"SMILES atom-token count ({len(spans)}) does not match RDKit atom count "
+                f"({mol.GetNumAtoms()}) for {smiles_str!r}."
+            )
+        return spans
+
+    def map_char_attention_to_atoms(self, smiles_str, attention_weights):
+        """Map character-level scores to RDKit atoms without treating ring digits as atoms."""
+        mol = Chem.MolFromSmiles(smiles_str)
+        if mol is None:
+            return None
+        try:
+            spans = self._atom_token_spans(smiles_str, mol)
+            scores = np.asarray(attention_weights, dtype=np.float64).reshape(-1)
+            atom_attention = []
+            for start, end, _ in spans:
+                valid_positions = [j for j in range(start, end) if j < scores.size]
+                atom_attention.append(
+                    float(scores[valid_positions].mean()) if valid_positions else 0.0
+                )
+            return atom_attention
+        except Exception as exc:
+            print(f"Error in mapping character attention to atoms: {exc}")
+            return None
+
+    def _save_attention_tables(self, smiles_str, attention_weights, atom_weights, output_path):
+        stem = os.path.splitext(output_path)[0]
+        char_rows = []
+        scores = np.asarray(attention_weights, dtype=np.float64).reshape(-1)
+        display_scores = safe_minmax(scores)
         for i, char in enumerate(smiles_str):
-            if char == ' ' or char.isspace() or char == '\x00':
-                continue
-                
-            valid_chars.append(char)
-            if i < len(attention_weights):
-                valid_attention.append(attention_weights[i])
-            else:
-                valid_attention.append(0.0)
-        
-        if not valid_chars:
-            print(f"Warning: No valid characters found for visualization. Skipping {output_path}")
+            char_rows.append({
+                'Char_Index': i,
+                'Character': char,
+                'Raw_Attention_Score': float(scores[i]) if i < scores.size else 0.0,
+                'Relative_Attention_Score': float(display_scores[i]) if i < display_scores.size else 0.0,
+            })
+        pd.DataFrame(char_rows).to_csv(f"{stem}_character_scores.csv", index=False)
+
+        mol = Chem.MolFromSmiles(smiles_str)
+        if mol is not None and atom_weights is not None:
+            atom_raw = np.asarray(atom_weights, dtype=np.float64)
+            atom_rel = safe_minmax(atom_raw)
+            atom_rows = []
+            for atom in mol.GetAtoms():
+                idx = atom.GetIdx()
+                atom_rows.append({
+                    'Atom_Index': idx,
+                    'Atom_Symbol': atom.GetSymbol(),
+                    'Is_Aromatic': atom.GetIsAromatic(),
+                    'Raw_Attention_Score': float(atom_raw[idx]),
+                    'Relative_Attention_Score': float(atom_rel[idx]),
+                })
+            pd.DataFrame(atom_rows).to_csv(f"{stem}_atom_scores.csv", index=False)
+
+        with open(f"{stem}_metadata.txt", 'w', encoding='utf-8') as handle:
+            for key, value in self.last_attention_metadata.items():
+                handle.write(f"{key}: {value}\n")
+
+    def visualize_smiles_attention(self, smiles_str, attention_weights, output_path,
+                                    title="SMILES Attention", true_label=None, prediction=None):
+        valid_chars = [c for c in smiles_str if not c.isspace() and c != '\x00']
+        raw = np.asarray(attention_weights, dtype=np.float64).reshape(-1)[:len(valid_chars)]
+        if not valid_chars or raw.size == 0:
+            print(f"Warning: No valid character attention for {output_path}")
             return
-        
+        relative = safe_minmax(raw)
+
         full_title = title
         if true_label is not None and prediction is not None:
-            full_title = f"{title}\nActual: {int(true_label)}, Prediction: {prediction:.4f}"
+            full_title = f"{title}\nActual: {int(true_label)}, Predicted probability: {prediction:.4f}"
         elif prediction is not None:
-            full_title = f"{title}\nPrediction: {prediction:.4f}"
-        
+            full_title = f"{title}\nPredicted probability: {prediction:.4f}"
+
         fig, ax = plt.subplots(figsize=(max(12, len(valid_chars) * 0.8), 6))
-        
-        norm = mcolors.Normalize(vmin=min(valid_attention), vmax=max(valid_attention))
         cmap = plt.cm.Reds
-        
-        for i, (char, attention) in enumerate(zip(valid_chars, valid_attention)):
-            color = cmap(norm(attention))
-            ax.text(i, 0.5, char, fontsize=15, ha='center', va='center', 
-                   bbox=dict(boxstyle="round,pad=0.3", facecolor=color, alpha=0.7))
-                   
+        norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+        for i, (char, score) in enumerate(zip(valid_chars, relative)):
+            ax.text(
+                i, 0.5, char, fontsize=15, ha='center', va='center',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=cmap(norm(score)), alpha=0.75)
+            )
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         cbar = plt.colorbar(sm, ax=ax)
-        cbar.set_label('Attention Weight', fontsize=15)
-        
+        cbar.set_label('Relative attention score (0-1)', fontsize=15)
         ax.set_xlim(-0.5, len(valid_chars) - 0.5)
         ax.set_ylim(0, 1)
         ax.set_title(full_title, fontsize=17)
         ax.axis('off')
-        
         plt.tight_layout()
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"SMILES attention visualization saved to {output_path}")
-    
-    def map_char_attention_to_atoms(self, smiles_str, attention_weights):
-        try:
-            mol = Chem.MolFromSmiles(smiles_str)
-            if mol is None:
-                return None
 
-            num_atoms = mol.GetNumAtoms()
-
-            atom_attention = [0.0] * num_atoms
-            atom_count = [0] * num_atoms
-
-            atom_pattern = re.compile(r'([A-Z][a-z]?|\[[^\]]+\]|[a-z]|[\+\-]\d*|\d+)')
-            matches = list(atom_pattern.finditer(smiles_str))
-
-            for i, match in enumerate(matches):
-                start, end = match.span()
-                if i < num_atoms:
-                    char_attention = []
-                    for j in range(start, end):
-                        if j < len(attention_weights):
-                            char_attention.append(attention_weights[j])
-                    
-                    if char_attention:
-                        atom_attention[i] = sum(char_attention) / len(char_attention)
-                        atom_count[i] = len(char_attention)
-            
-            return atom_attention
-        except Exception as e:
-            print(f"Error in mapping char attention to atoms: {str(e)}")
-            return None
-    
-    def visualize_molecule_attention(self, smiles_str, attention_weights, output_path, 
-                                   title="Molecular Attention", true_label=None, prediction=None):
+    def visualize_molecule_attention(self, smiles_str, attention_weights, output_path,
+                                     title="Molecular Attention", true_label=None, prediction=None):
         try:
             mol = Chem.MolFromSmiles(smiles_str)
             if mol is None:
@@ -211,201 +353,122 @@ class SMILESAttentionExplainer:
                 return
 
             atom_weights = self.map_char_attention_to_atoms(smiles_str, attention_weights)
-            
             if atom_weights is None:
-                num_atoms = mol.GetNumAtoms()
-                atom_weights = [sum(attention_weights) / len(attention_weights)] * num_atoms
-            
-            max_weight = max(atom_weights) if max(atom_weights) > 0 else 1.0
-            min_weight = min(atom_weights) if min(atom_weights) < max_weight else 0.0
-            norm_weights = [(w - min_weight) / (max_weight - min_weight) for w in atom_weights]
-            
-            full_title = title
-            if true_label is not None and prediction is not None:
-                full_title = f"{title}\nActual: {int(true_label)}, Prediction: {prediction:.4f}"
-            elif prediction is not None:
-                full_title = f"{title}\nPrediction: {prediction:.4f}"
-            
-            fig = plt.figure(figsize=(10, 8))
-            
-            try:
-                from rdkit.Chem.Draw import MolDraw2DCairo
-                drawer = MolDraw2DCairo(800, 800)
-                
-                SimilarityMaps.GetSimilarityMapFromWeights(
-                    mol, norm_weights, 
-                    draw2d=drawer,
-                    colorMap=plt.cm.Reds,
-                    contourLines=10,
-                    coordScale=1.5,
-                    alpha=0.0
-                )
-
-                drawer.WriteDrawingText(output_path)
-
-                img = Image.open(output_path)
-
-                fig, (ax_img, ax_cbar) = plt.subplots(1, 2, figsize=(12, 8), 
-                                                     gridspec_kw={'width_ratios': [5, 1]})
-                
-                ax_img.imshow(np.array(img))
-                ax_img.set_title(full_title, fontsize=19, pad=20)
-                ax_img.axis('off')
-
-                norm = mcolors.Normalize(vmin=min_weight, vmax=max_weight)
-                sm = plt.cm.ScalarMappable(cmap=plt.cm.Reds, norm=norm)
-                sm.set_array([])
-                cbar = plt.colorbar(sm, cax=ax_cbar)
-                cbar.set_label('Attention Weight', fontsize=15)
-
-                plt.tight_layout()
-                plt.savefig(output_path, dpi=300, bbox_inches='tight')
-                plt.close()
-                
-                print(f"High-resolution molecular attention visualization saved to {output_path}")
-                
-            except Exception as e:
-                print(f"Error in molecular visualization with MolDraw2DCairo: {str(e)}")
-                try:
-                    img = SimilarityMaps.GetSimilarityMapFromWeights(
-                        mol, norm_weights,
-                        colorMap=plt.cm.Reds,
-                        contourLines=10,
-                        coordScale=1.5
-                    )
-                    
-                    fig, (ax_img, ax_cbar) = plt.subplots(1, 2, figsize=(12, 8), 
-                                                         gridspec_kw={'width_ratios': [5, 1]})
-                    
-                    ax_img.imshow(np.array(img))
-                    ax_img.set_title(full_title, fontsize=19, pad=20)
-                    ax_img.axis('off')
-                    
-                    norm = mcolors.Normalize(vmin=min_weight, vmax=max_weight)
-                    sm = plt.cm.ScalarMappable(cmap=plt.cm.Reds, norm=norm)
-                    sm.set_array([])
-                    cbar = plt.colorbar(sm, cax=ax_cbar)
-                    cbar.set_label('Attention Weight', fontsize=15)
-
-                    plt.tight_layout()
-                    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-                    plt.close()
-                    
-                    print(f"Alternative molecular attention visualization saved to {output_path}")
-                    
-                except Exception as e2:
-                    print(f"Alternative method also failed: {str(e2)}")
-                    try:
-                        img = Draw.MolToImage(mol, size=(800, 800))
-
-                        fig, ax = plt.subplots(figsize=(10, 8))
-                        ax.imshow(np.array(img))
-                        ax.set_title(full_title, fontsize=19, pad=20)
-                        ax.axis('off')
-
-                        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-                        plt.close()
-                        
-                        print(f"Fallback molecular image saved to {output_path}")
-                    except Exception as e3:
-                        print(f"Fallback also failed: {str(e3)}")
-            
-        except Exception as e:
-            print(f"Error in molecular visualization: {str(e)}")
-            try:
-                mol = Chem.MolFromSmiles(smiles_str)
-                if mol is not None:
-                    img = Draw.MolToImage(mol, size=(800, 800))
-                    plt.figure(figsize=(10, 8))
-                    plt.imshow(np.array(img))
-                    plt.title(full_title, fontsize=19, pad=20)
-                    plt.axis('off')
-                    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-                    plt.close()
-                    
-                    print(f"Fallback molecular image saved to {output_path}")
-            except Exception as e2:
-                print(f"Fallback also failed: {str(e2)}")
-    
-    def visualize_cross_attention_heatmap(self, smiles_str, protein_str, cross_attention_matrix, 
-                                        output_path, title="Cross Attention Heatmap", 
-                                        true_label=None, prediction=None, aa_per_row=60):
-        try:
-            valid_smiles_chars = []
-            valid_protein_chars = []
-            for i, char in enumerate(smiles_str):
-                if char == ' ' or char.isspace() or char == '\x00' or i >= cross_attention_matrix.shape[0]:
-                    continue
-                valid_smiles_chars.append(char)
-            for j, char in enumerate(protein_str):
-                if char == ' ' or char.isspace() or char == '\x00' or j >= cross_attention_matrix.shape[1]:
-                    continue
-                valid_protein_chars.append(char)
-            valid_matrix = cross_attention_matrix[:len(valid_smiles_chars), :len(valid_protein_chars)]
-            
-            if valid_matrix.size == 0:
-                print(f"Warning: No valid attention matrix for visualization. Skipping {output_path}")
+                print(f"Warning: Atom mapping failed; molecular attention was not drawn for {smiles_str}")
                 return
-            
+
+            atom_raw = np.asarray(atom_weights, dtype=np.float64)
+            atom_relative = safe_minmax(atom_raw).tolist()
+            self._save_attention_tables(smiles_str, attention_weights, atom_raw, output_path)
+
             full_title = title
             if true_label is not None and prediction is not None:
-                full_title = f"{title}\nActual: {int(true_label)}, Prediction: {prediction:.4f}"
+                full_title = f"{title}\nActual: {int(true_label)}, Predicted probability: {prediction:.4f}"
             elif prediction is not None:
-                full_title = f"{title}\nPrediction: {prediction:.4f}"
+                full_title = f"{title}\nPredicted probability: {prediction:.4f}"
 
-            n_rows = (len(valid_protein_chars) + aa_per_row - 1) // aa_per_row
+            from rdkit.Chem.Draw import MolDraw2DCairo
+            drawer = MolDraw2DCairo(800, 800)
+            SimilarityMaps.GetSimilarityMapFromWeights(
+                mol,
+                atom_relative,
+                drawer,
+                colorMap=plt.cm.Reds,
+                contourLines=10,
+                coordScale=1.5,
+            )
+            drawer.FinishDrawing()
+            png_data = drawer.GetDrawingText()
+            img = Image.open(io.BytesIO(png_data))
 
-            fig, axes = plt.subplots(n_rows, 1, figsize=(max(12, aa_per_row * 0.5), max(4 * n_rows, 6)))
-
-            if n_rows == 1:
-                axes = [axes]
-
-            vmin, vmax = np.min(valid_matrix), np.max(valid_matrix)
-
-            for row_idx in range(n_rows):
-                start_idx = row_idx * aa_per_row
-                end_idx = min((row_idx + 1) * aa_per_row, len(valid_protein_chars))
-
-                current_protein_chars = valid_protein_chars[start_idx:end_idx]
-                current_matrix = valid_matrix[:, start_idx:end_idx]
-
-                im = axes[row_idx].imshow(current_matrix, cmap='Reds', aspect='auto', 
-                                        interpolation='nearest', vmin=vmin, vmax=vmax)
-
-                axes[row_idx].set_xticks(range(len(current_protein_chars)))
-                axes[row_idx].set_xticklabels(current_protein_chars, fontsize=10, rotation=0)
-                axes[row_idx].set_yticks(range(len(valid_smiles_chars)))
-                axes[row_idx].set_yticklabels(valid_smiles_chars, fontsize=10)
-                
-                axes[row_idx].set_ylabel(f'AA {start_idx+1}-{end_idx}', fontsize=10)
-
-                axes[row_idx].set_xticks(np.arange(-0.5, len(current_protein_chars), 1), minor=True)
-                axes[row_idx].set_yticks(np.arange(-0.5, len(valid_smiles_chars), 1), minor=True)
-                axes[row_idx].grid(which="minor", color="gray", linestyle='-', linewidth=0.1, alpha=0.3)
-
-            cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
-            cbar = fig.colorbar(im, cax=cbar_ax)
-            cbar.set_label('Attention Weight', fontsize=15)
-
-            fig.suptitle(full_title, fontsize=17, y=0.98)
-            fig.text(0.5, 0.02, 'Protein Sequence', ha='center', fontsize=15)
-            fig.text(0.02, 0.5, 'SMILES Sequence', va='center', rotation='vertical', fontsize=15)
-
-            plt.tight_layout(rect=[0.03, 0.03, 0.9, 0.95])
+            fig, (ax_img, ax_cbar) = plt.subplots(
+                1, 2, figsize=(12, 8), gridspec_kw={'width_ratios': [5, 1]}
+            )
+            ax_img.imshow(np.array(img))
+            ax_img.set_title(full_title, fontsize=19, pad=20)
+            ax_img.axis('off')
+            norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+            sm = plt.cm.ScalarMappable(cmap=plt.cm.Reds, norm=norm)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, cax=ax_cbar)
+            cbar.set_label('Relative attention score (0-1)', fontsize=15)
+            plt.tight_layout()
             plt.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close()
-            
-            print(f"Cross attention heatmap saved to {output_path}")
+            print(f"Molecular attention visualization saved to {output_path}")
+        except Exception as exc:
+            print(f"Error in molecular attention visualization: {exc}")
+            import traceback
+            traceback.print_exc()
+
+    def visualize_cross_attention_heatmap(self, smiles_str, protein_str, cross_attention_matrix,
+                                          output_path, title="Cross Attention Heatmap",
+                                          true_label=None, prediction=None, aa_per_row=60):
+        try:
+            matrix = np.asarray(cross_attention_matrix, dtype=np.float64)
+            n_smiles = min(len(smiles_str), matrix.shape[0])
+            n_protein = min(len(protein_str.rstrip()), matrix.shape[1])
+            valid_smiles_chars = list(smiles_str[:n_smiles])
+            valid_protein_chars = list(protein_str[:n_protein])
+            valid_matrix = matrix[:n_smiles, :n_protein]
+            if valid_matrix.size == 0:
+                print(f"Warning: No valid attention matrix for {output_path}")
+                return
+
+            full_title = title
+            if true_label is not None and prediction is not None:
+                full_title = f"{title}\nActual: {int(true_label)}, Predicted probability: {prediction:.4f}"
+            elif prediction is not None:
+                full_title = f"{title}\nPredicted probability: {prediction:.4f}"
+
+            n_rows = max(1, (len(valid_protein_chars) + aa_per_row - 1) // aa_per_row)
+            fig, axes = plt.subplots(
+                n_rows, 1,
+                figsize=(max(12, aa_per_row * 0.5), max(4 * n_rows, 6)),
+                squeeze=False,
+            )
+            axes = axes[:, 0]
+            vmin, vmax = float(valid_matrix.min()), float(valid_matrix.max())
+            if np.isclose(vmin, vmax):
+                vmax = vmin + 1e-12
+
+            for row_idx, ax in enumerate(axes):
+                start_idx = row_idx * aa_per_row
+                end_idx = min((row_idx + 1) * aa_per_row, len(valid_protein_chars))
+                chars = valid_protein_chars[start_idx:end_idx]
+                current = valid_matrix[:, start_idx:end_idx]
+                im = ax.imshow(
+                    current, cmap='Reds', aspect='auto', interpolation='nearest',
+                    vmin=vmin, vmax=vmax
+                )
+                ax.set_xticks(range(len(chars)))
+                ax.set_xticklabels(chars, fontsize=9)
+                ax.set_yticks(range(len(valid_smiles_chars)))
+                ax.set_yticklabels(valid_smiles_chars, fontsize=9)
+                ax.set_ylabel('SMILES token', fontsize=10)
+                ax.set_title(f"Protein positions {start_idx + 1}-{end_idx}", fontsize=10)
+
+            cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+            cbar = fig.colorbar(im, cax=cbar_ax)
+            cbar.set_label('Head-averaged cross-attention weight', fontsize=13)
+            fig.suptitle(full_title, fontsize=17, y=0.99)
+            fig.text(0.5, 0.015, 'Protein sequence position', ha='center', fontsize=13)
+            plt.tight_layout(rect=[0.03, 0.03, 0.9, 0.96])
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
 
             matrix_path = output_path.replace('.png', '_matrix.txt')
-            np.savetxt(matrix_path, valid_matrix, fmt='%.6f')
-            print(f"Cross attention matrix saved to {matrix_path}")
-            
-        except Exception as e:
-            print(f"Error in cross attention visualization: {str(e)}")
-    
+            np.savetxt(matrix_path, valid_matrix, fmt='%.8f')
+            print(f"Cross-attention heatmap saved to {output_path}")
+        except Exception as exc:
+            print(f"Error in cross-attention visualization: {exc}")
+            import traceback
+            traceback.print_exc()
+
     def explain(self, smiles_tensor, protein_tensor, smiles_str, protein_str):
-        smiles_attention, cross_attention_matrix, prediction = self.extract_attention(smiles_tensor, protein_tensor)
+        smiles_attention, cross_attention_matrix, prediction = self.extract_attention(
+            smiles_tensor, protein_tensor
+        )
         return smiles_attention, cross_attention_matrix, prediction, smiles_str, protein_str
 
 def evaluate_model(model, data_loader, device, model_name="Final Model", explainer=None, local_sample_indices=None, smiles_strings=None, protein_strings=None):
@@ -427,8 +490,7 @@ def evaluate_model(model, data_loader, device, model_name="Final Model", explain
                 protein = protein.to(device)
                 
             outputs, _ = model(smiles, protein)
-            
-            probs = outputs.cpu().numpy().astype(float)
+            probs = output_to_probability_tensor(outputs).detach().cpu().numpy().astype(float)
             if probs.ndim == 0:
                 probs = np.array([probs])
                 
@@ -641,7 +703,28 @@ def visualize_sequence_features(sequences, labels, results_dir=RESULTS_DIR):
         
         features = np.array(features)
 
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=300, n_jobs=1)
+        n_samples = features.shape[0]
+        if n_samples < 3:
+            raise ValueError(f"Too few samples for t-SNE: n_samples={n_samples}")
+
+        perplexity = max(1, min(30, n_samples - 1))
+
+        # scikit-learn >= 1.5 uses max_iter; older versions used n_iter.
+        import inspect
+        tsne_params = inspect.signature(TSNE).parameters
+        tsne_kwargs = {
+            "n_components": 2,
+            "random_state": 42,
+            "perplexity": perplexity,
+        }
+        if "max_iter" in tsne_params:
+            tsne_kwargs["max_iter"] = 300
+        elif "n_iter" in tsne_params:
+            tsne_kwargs["n_iter"] = 300
+        if "n_jobs" in tsne_params:
+            tsne_kwargs["n_jobs"] = 1
+
+        tsne = TSNE(**tsne_kwargs)
         features_2d = tsne.fit_transform(features)
 
         plt.figure(figsize=(10, 8))
@@ -658,9 +741,16 @@ def visualize_sequence_features(sequences, labels, results_dir=RESULTS_DIR):
     except Exception as e:
         print(f"Error in t-SNE visualization: {str(e)}")
         try:
+            n_components = min(2, features.shape[0], features.shape[1])
+            if n_components < 2:
+                raise ValueError(
+                    f"Too few samples/features for 2D PCA: "
+                    f"n_samples={features.shape[0]}, n_features={features.shape[1]}"
+                )
+
             pca = PCA(n_components=2, random_state=42)
             features_2d = pca.fit_transform(features)
-            
+
             plt.figure(figsize=(10, 8))
             scatter = plt.scatter(features_2d[:, 0], features_2d[:, 1], c=labels, cmap='viridis', alpha=0.7)
             plt.colorbar(scatter, label='Class Label')
@@ -668,7 +758,7 @@ def visualize_sequence_features(sequences, labels, results_dir=RESULTS_DIR):
             plt.xlabel('Principal Component 1')
             plt.ylabel('Principal Component 2')
             plt.grid(True, alpha=0.3)
-            
+
             plt.savefig(os.path.join(results_dir, 'sequence_pca.png'), dpi=300, bbox_inches='tight')
             plt.close()
             print("PCA visualization saved as fallback")
@@ -724,19 +814,25 @@ def analyze_sequence_features(sequences, labels, results_dir=RESULTS_DIR):
                 desc = CharExplainer.get_char_description(char_idx)
                 f.write(f"{i+1}. {desc}: Variance = {var:.6f}\n")
 
-        pca = PCA(n_components=2, random_state=42)
-        features_pca = pca.fit_transform(mean_features)
-        
-        plt.figure(figsize=(10, 8))
-        plt.scatter(features_pca[:, 0], features_pca[:, 1], c=unique_labels, cmap='viridis', s=100)
-        for i, label in enumerate(unique_labels):
-            plt.annotate(f'Class {int(label)}', (features_pca[i, 0], features_pca[i, 1]))
-        plt.xlabel('Principal Component 1')
-        plt.ylabel('Principal Component 2')
-        plt.title('Class Centroids in PCA Space')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(results_dir, 'class_centroids_pca.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+        if mean_features.ndim == 2 and min(mean_features.shape) >= 2 and len(unique_labels) >= 2:
+            pca = PCA(n_components=2, random_state=42)
+            features_pca = pca.fit_transform(mean_features)
+
+            plt.figure(figsize=(10, 8))
+            plt.scatter(features_pca[:, 0], features_pca[:, 1], c=unique_labels, cmap='viridis', s=100)
+            for i, label in enumerate(unique_labels):
+                plt.annotate(f'Class {int(label)}', (features_pca[i, 0], features_pca[i, 1]))
+            plt.xlabel('Principal Component 1')
+            plt.ylabel('Principal Component 2')
+            plt.title('Class Centroids in PCA Space')
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(results_dir, 'class_centroids_pca.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+        else:
+            print(
+                "Skipping class centroid PCA: need at least 2 classes and 2 feature dimensions. "
+                f"unique_labels={len(unique_labels)}, mean_features_shape={mean_features.shape}"
+            )
 
         plt.figure(figsize=(14, 12))
         if features.shape[1] > 20:
@@ -847,7 +943,7 @@ def main():
         train_smiles = train_data['smiles']
         train_proteins = train_data['proteins']
 
-        test_data = np.load('processed_data/test.npz')
+        test_data = np.load('processed_data/external_validation.npz')  ###在这里修改
         test_smiles = test_data['smiles']
         test_proteins = test_data['proteins']
         test_labels = test_data['labels']
