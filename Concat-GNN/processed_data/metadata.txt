@@ -1,0 +1,8 @@
+num_external_validation: 4
+max_nodes: 50
+max_edges: 100
+max_protein_len: 480
+atom_dict_size: 7
+fingerprint_dict_size: 39
+edge_dict_size: 42
+protein_chars_size: 21
