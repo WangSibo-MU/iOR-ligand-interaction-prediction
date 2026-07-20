@@ -1,0 +1,11 @@
+Sample index: 1
+Actual label: 1
+Predicted probability: 0.55297858
+Real atom count: 10
+Real bond count: 10
+Node mask type: object
+Padded node count in mask: 40
+Padded node mask mean/max: 0.00000000/0.00000000
+Unmapped/padded edge count: 80
+Unmapped/padded edge mask mean/max: 0.00000000/0.00000000
+Real bond mask mean/max: 0.45860602/0.93208751

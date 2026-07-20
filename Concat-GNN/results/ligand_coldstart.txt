@@ -1,0 +1,7 @@
+Test Set Size: 922
+AUC: 0.7993
+Accuracy: 0.7278
+F1 Score: 0.7383
+Recall: 0.7679
+MCC: 0.4570
+Threshold: 0.5000 (Fixed at 0.5)
