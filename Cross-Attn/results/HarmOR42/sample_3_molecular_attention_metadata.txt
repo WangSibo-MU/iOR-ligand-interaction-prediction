@@ -1,0 +1,8 @@
+original_shape: (1, 70, 480)
+oriented_shape: (1, 70, 480)
+transposed: False
+reduction: topk_mean
+valid_smiles_tokens: 70
+valid_protein_tokens: 480
+raw_score_min: 0.017339278982641797
+raw_score_max: 0.01889922838502874

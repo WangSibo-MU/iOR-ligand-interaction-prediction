@@ -1,0 +1,8 @@
+Model Name: Final Model
+Test Set Size: 914 samples
+AUC: 0.7065
+Accuracy: 0.6521
+F1 Score: 0.6187
+Recall: 0.5646
+Matthews Correlation Coefficient (MCC): 0.3089
+Threshold: 0.5000 (Fixed at 0.5)
