@@ -22,9 +22,9 @@ USE_GPU = True
 SHAP_CONFIG = {
     'do_global_shap': False,           
     'do_local_shap': True,            
-    'sample_indices': [608, 609, 610],  #Fill in the position of the target visualization sample in the dataset here
-    'compute_all_shap': False,        
-    'background_size': 50             
+    'sample_indices': [0, 1, 2, 3],  #Fill in the position of the target visualization sample in the dataset here
+    'compute_all_shap': True,        
+    'background_size': 200             
 }
 # =====================================================
 
@@ -255,7 +255,7 @@ def main():
 
     print("loading test data...")
     try:
-        test_data = np.load('processed_data/test.npz', allow_pickle=True)
+        test_data = np.load('processed_data/external_validation.npz', allow_pickle=True)  ###
         test_smiles = test_data['smiles']
         test_proteins = test_data['proteins']
         test_labels = test_data['labels']

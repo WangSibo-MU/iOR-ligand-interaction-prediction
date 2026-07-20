@@ -1,9 +1,11 @@
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from sklearn.model_selection import StratifiedKFold
+# 引入 StratifiedKFold 与 StratifiedGroupKFold 实现冷启动下的均衡交叉验证
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, recall_score, matthews_corrcoef, roc_curve
 from sklearn.preprocessing import StandardScaler
 import joblib
@@ -71,6 +73,16 @@ def evaluate_model(model, data_loader, device):
     return auc, acc, f1, recall, mcc, predictions, true_labels
 
 def main():
+    # ================= 命令行参数解析 =================
+    parser = argparse.ArgumentParser(description="Train CPI Predictor with Cold Start and CV options.")
+    parser.add_argument('--ligand_cold_start', action='store_true', help='Enable ligand cold start for cross-validation.')
+    parser.add_argument('--protein_cold_start', action='store_true', help='Enable protein cold start for cross-validation.')
+    parser.add_argument('--balance_samples', action='store_true', help='Force equal number of positive and negative samples via downsampling within folds.')
+    args = parser.parse_args()
+
+    if args.ligand_cold_start and args.protein_cold_start:
+        raise ValueError("Cannot enable both ligand cold start and protein cold start at the same time. Please choose one.")
+
     print("="*60)
     print("Model training...")
     print("="*60)
@@ -101,23 +113,76 @@ def main():
     ligand_features = torch.FloatTensor(ligand_features)
     labels = torch.FloatTensor(labels)
 
-    kfold = StratifiedKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+    # ================= 交叉验证策略分发 =================
+    if args.ligand_cold_start:
+        print("\n[Cold Start Option] Using StratifiedGroupKFold (Ligand Cold Start).")
+        groups = np.array([str(s).strip() for s in smiles])
+        kfold = StratifiedGroupKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+        split_iterator = kfold.split(encoded_proteins, labels, groups)
+    elif args.protein_cold_start:
+        print("\n[Cold Start Option] Using StratifiedGroupKFold (Protein Cold Start).")
+        groups = np.array([str(p).strip() for p in proteins])
+        kfold = StratifiedGroupKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+        split_iterator = kfold.split(encoded_proteins, labels, groups)
+    else:
+        print("\n[Default Mode] Using Random Stratified (StratifiedKFold).")
+        kfold = StratifiedKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+        split_iterator = kfold.split(encoded_proteins, labels)
+
     results_nn = []
     all_nn_preds = np.zeros(len(labels))
 
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(encoded_proteins, labels)):
+    for fold, (train_idx, val_idx) in enumerate(split_iterator):
         print(f'\nFold {fold + 1}/{config.k_folds}')
 
-        train_proteins = encoded_proteins[train_idx]
-        train_ligand = ligand_features[train_idx]
-        train_labels = labels[train_idx]
+        # 提取当前 Fold 的原始数据
+        fold_train_proteins = encoded_proteins[train_idx]
+        fold_train_ligand = ligand_features[train_idx]
+        fold_train_labels = labels[train_idx]
         
-        val_proteins = encoded_proteins[val_idx]
-        val_ligand = ligand_features[val_idx]
-        val_labels = labels[val_idx]
+        fold_val_proteins = encoded_proteins[val_idx]
+        fold_val_ligand = ligand_features[val_idx]
+        fold_val_labels = labels[val_idx]
 
-        train_dataset = CPIDataset(train_proteins, train_ligand, train_labels)
-        val_dataset = CPIDataset(val_proteins, val_ligand, val_labels)
+        # ================= 折内动态平衡机制 =================
+        if args.balance_samples:
+            # 1. 训练集严格 1:1
+            train_labels_np = fold_train_labels.numpy()
+            pos_train_idx = np.where(train_labels_np == 1)[0]
+            neg_train_idx = np.where(train_labels_np == 0)[0]
+            train_min_count = min(len(pos_train_idx), len(neg_train_idx))
+            
+            rng = np.random.default_rng(42 + fold)
+            pos_train_sampled = rng.choice(pos_train_idx, train_min_count, replace=False)
+            neg_train_sampled = rng.choice(neg_train_idx, train_min_count, replace=False)
+            balanced_train_idx = np.concatenate([pos_train_sampled, neg_train_sampled])
+            rng.shuffle(balanced_train_idx)
+            
+            fold_train_proteins = fold_train_proteins[balanced_train_idx]
+            fold_train_ligand = fold_train_ligand[balanced_train_idx]
+            fold_train_labels = fold_train_labels[balanced_train_idx]
+
+            # 2. 验证集严格 1:1
+            val_labels_np = fold_val_labels.numpy()
+            pos_val_idx = np.where(val_labels_np == 1)[0]
+            neg_val_idx = np.where(val_labels_np == 0)[0]
+            val_min_count = min(len(pos_val_idx), len(neg_val_idx))
+            
+            pos_val_sampled = rng.choice(pos_val_idx, val_min_count, replace=False)
+            neg_val_sampled = rng.choice(neg_val_idx, val_min_count, replace=False)
+            balanced_val_idx = np.concatenate([pos_val_sampled, neg_val_sampled])
+            rng.shuffle(balanced_val_idx)
+            
+            fold_val_proteins = fold_val_proteins[balanced_val_idx]
+            fold_val_ligand = fold_val_ligand[balanced_val_idx]
+            fold_val_labels = fold_val_labels[balanced_val_idx]
+
+        # 打印各 Fold 真实参与训练和验证的样本分布
+        print(f"  - [Final Balanced] Train Size: {len(fold_train_labels)} (Pos: {int(np.sum(fold_train_labels.numpy()==1))}, Neg: {int(np.sum(fold_train_labels.numpy()==0))})")
+        print(f"  - [Final Balanced] Val Size:   {len(fold_val_labels)} (Pos: {int(np.sum(fold_val_labels.numpy()==1))}, Neg: {int(np.sum(fold_val_labels.numpy()==0))})")
+
+        train_dataset = CPIDataset(fold_train_proteins, fold_train_ligand, fold_train_labels)
+        val_dataset = CPIDataset(fold_val_proteins, fold_val_ligand, fold_val_labels)
         
         train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
@@ -153,6 +218,7 @@ def main():
                 best_recall = recall
                 best_mcc = mcc
                 best_model_state = model.state_dict()
+                best_preds = preds
             
             if (epoch + 1) % 5 == 0:
                 print(f'Epoch {epoch + 1}/{config.num_epochs}, Loss: {train_loss:.4f}, '
@@ -169,7 +235,10 @@ def main():
             'mcc': best_mcc
         })
 
-        all_nn_preds[val_idx] = preds
+        if args.balance_samples:
+            pass  # 如果经过动态平衡降采样，索引已脱离原 val_idx 的对应关系，忽略全局写入
+        else:
+            all_nn_preds[val_idx] = best_preds
 
     avg_auc_nn = np.mean([r['auc'] for r in results_nn])
     avg_acc_nn = np.mean([r['acc'] for r in results_nn])
@@ -188,7 +257,28 @@ def main():
 
     print("\nTraining final model...")
 
-    full_dataset = CPIDataset(encoded_proteins, ligand_features, labels)
+    # 最终模型训练的数据平衡
+    final_proteins = encoded_proteins
+    final_ligands = ligand_features
+    final_labels = labels
+    
+    if args.balance_samples:
+        pos_idx = np.where(labels == 1)[0]
+        neg_idx = np.where(labels == 0)[0]
+        min_count = min(len(pos_idx), len(neg_idx))
+        
+        rng = np.random.default_rng(42)
+        pos_sampled = rng.choice(pos_idx, min_count, replace=False)
+        neg_sampled = rng.choice(neg_idx, min_count, replace=False)
+        balanced_idx = np.concatenate([pos_sampled, neg_sampled])
+        rng.shuffle(balanced_idx)
+        
+        final_proteins = final_proteins[balanced_idx]
+        final_ligands = final_ligands[balanced_idx]
+        final_labels = final_labels[balanced_idx]
+        print(f"Final Model Dataset Balanced to {len(final_labels)} samples (Pos: {min_count}, Neg: {min_count}).")
+
+    full_dataset = CPIDataset(final_proteins, final_ligands, final_labels)
     full_loader = DataLoader(full_dataset, batch_size=config.batch_size, shuffle=True)
     
     final_nn_model = CPIPredictor(

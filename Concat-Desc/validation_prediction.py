@@ -247,7 +247,7 @@ def main():
 
         print("Loading test data...")
         try:
-            test_data = np.load('processed_data/test.npz', allow_pickle=True)
+            test_data = np.load('processed_data/external_validation.npz', allow_pickle=True) ###
             test_smiles = test_data['smiles']
             test_proteins = test_data['proteins']
             test_labels = test_data['labels']
