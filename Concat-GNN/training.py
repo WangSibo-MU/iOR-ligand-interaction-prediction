@@ -5,11 +5,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
-from sklearn.model_selection import StratifiedKFold
+# 引入 StratifiedKFold 与 StratifiedGroupKFold 实现冷启动下的均衡交叉验证
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, recall_score, matthews_corrcoef, roc_curve
 import warnings
-warnings.filterwarnings('ignore')
 import os
+import argparse
 import pickle
 from utils import Config, CharTokenizer, CompoundGNN, ProteinTransformer, CPIPredictor
 
@@ -20,6 +21,47 @@ np.random.seed(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 config = Config()
+
+
+def normalize_compound_graphs(compound_graphs):
+    """Validate/repair loaded compound graphs.
+
+    Expected format is list[torch_geometric.data.Data]. Some older preprocessed
+    files may contain list-of-(key, value) pairs because PyG Data objects were
+    converted through numpy before saving.
+    """
+    if len(compound_graphs) == 0:
+        raise ValueError("train_compounds.pt is empty.")
+
+    first = compound_graphs[0]
+    if hasattr(first, 'x') and hasattr(first, 'edge_index'):
+        return compound_graphs
+
+    repaired = []
+    for graph in compound_graphs:
+        if hasattr(graph, 'x') and hasattr(graph, 'edge_index'):
+            repaired.append(graph)
+            continue
+
+        # Possible legacy format: [('x', tensor), ('edge_index', tensor), ('edge_attr', tensor)]
+        if isinstance(graph, (list, tuple)):
+            try:
+                graph_dict = dict(graph)
+                if 'x' in graph_dict and 'edge_index' in graph_dict:
+                    repaired.append(Data(**graph_dict))
+                    continue
+            except Exception:
+                pass
+
+        raise TypeError(
+            "train_compounds.pt has invalid graph format. Expected each item to be "
+            "torch_geometric.data.Data with attributes .x and .edge_index, but got "
+            f"{type(graph).__name__}. Regenerate processed_data using the fixed data_processing.py."
+        )
+
+    print("Warning: repaired legacy list-form compound graphs into PyG Data objects. "
+          "Regenerating processed_data with fixed data_processing.py is still recommended.")
+    return repaired
 
 class ORLigandDataset(Dataset):
     def __init__(self, compound_graphs, proteins, labels, protein_tokenizer, protein_max_len):
@@ -109,19 +151,35 @@ def evaluate_model(model, data_loader, device):
     return auc, acc, f1, recall, mcc
 
 def main():
+    # ================= 命令行参数解析 =================
+    parser = argparse.ArgumentParser(description="Train CPI Predictor with CV options.")
+    parser.add_argument('--ligand_cold_start', action='store_true', help='Enable ligand cold start for cross-validation (SMILES group split).')
+    parser.add_argument('--protein_cold_start', action='store_true', help='Enable protein cold start for cross-validation (Protein sequence group split).')
+    parser.add_argument('--balance_samples', action='store_true', help='Force equal number of positive and negative samples via downsampling within each CV fold.')
+    args = parser.parse_args()
+
+    # 互斥安全检查（双冷启动不支持）
+    if args.ligand_cold_start and args.protein_cold_start:
+        raise ValueError("Cannot enable both ligand cold start and protein cold start at the same time. Please choose one.")
+
     print("Loading processed data...")
     try:
         compound_graphs = torch.load('processed_data/train_compounds.pt')
+        compound_graphs = normalize_compound_graphs(compound_graphs)
         
         train_data = np.load('processed_data/train_data.npz')
         proteins = train_data['proteins']
         labels = train_data['labels']
+        
+        # 获取用于冷启动 Group 划分的 SMILES (需要确保在 data_processing 阶段保存了 smiles)
+        smiles = train_data['smiles']
         
         print(f"Loaded {len(compound_graphs)} training compounds")
         print(f"Node feature dimension: {compound_graphs[0].x.shape[1]}")
     except Exception as e:
         print(f"Error loading processed data: {e}")
         return
+        
     print("Loading protein character set...")
     try:
         with open('processed_data/protein_chars.pkl', 'rb') as f:
@@ -134,27 +192,78 @@ def main():
     
     node_in_dim = compound_graphs[0].x.shape[1]
     
-    kfold = StratifiedKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+    # ================= 交叉验证分发策略 =================
+    if args.ligand_cold_start:
+        print("\n[Cold Start Option] Using StratifiedGroupKFold (Ligand Cold Start) for Cross-Validation.")
+        groups = np.array([s.strip() for s in smiles])
+        kfold = StratifiedGroupKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+        split_iterator = kfold.split(compound_graphs, labels, groups)
+    elif args.protein_cold_start:
+        print("\n[Cold Start Option] Using StratifiedGroupKFold (Protein Cold Start) for Cross-Validation.")
+        groups = np.array([p.strip() for p in proteins])
+        kfold = StratifiedGroupKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+        split_iterator = kfold.split(compound_graphs, labels, groups)
+    else:
+        print("\n[Default Mode] Using Random Stratified (StratifiedKFold) for Cross-Validation.")
+        kfold = StratifiedKFold(n_splits=config.k_folds, shuffle=True, random_state=42)
+        split_iterator = kfold.split(compound_graphs, labels)
+
     results = []
     
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(compound_graphs, labels)):
+    for fold, (train_idx, val_idx) in enumerate(split_iterator):
         print(f'\nFold {fold + 1}/{config.k_folds}')
         
-        train_compounds = [compound_graphs[i] for i in train_idx]
-        train_proteins = proteins[train_idx]
-        train_labels = labels[train_idx]
+        # 提取当前 Fold 的原始未均衡数据
+        fold_train_compounds = [compound_graphs[i] for i in train_idx]
+        fold_train_proteins = proteins[train_idx]
+        fold_train_labels = labels[train_idx]
         
-        val_compounds = [compound_graphs[i] for i in val_idx]
-        val_proteins = proteins[val_idx]
-        val_labels = labels[val_idx]
+        fold_val_compounds = [compound_graphs[i] for i in val_idx]
+        fold_val_proteins = proteins[val_idx]
+        fold_val_labels = labels[val_idx]
+        
+        # ================= 折内动态平衡机制 =================
+        if args.balance_samples:
+            # 1. 训练子集严格下采样 1:1
+            pos_train_idx = np.where(fold_train_labels == 1)[0]
+            neg_train_idx = np.where(fold_train_labels == 0)[0]
+            train_min_count = min(len(pos_train_idx), len(neg_train_idx))
+            
+            rng = np.random.default_rng(42 + fold)
+            pos_train_sampled = rng.choice(pos_train_idx, train_min_count, replace=False)
+            neg_train_sampled = rng.choice(neg_train_idx, train_min_count, replace=False)
+            balanced_train_idx = np.concatenate([pos_train_sampled, neg_train_sampled])
+            rng.shuffle(balanced_train_idx)
+            
+            fold_train_compounds = [fold_train_compounds[i] for i in balanced_train_idx]
+            fold_train_proteins = fold_train_proteins[balanced_train_idx]
+            fold_train_labels = fold_train_labels[balanced_train_idx]
+
+            # 2. 验证子集严格下采样 1:1
+            pos_val_idx = np.where(fold_val_labels == 1)[0]
+            neg_val_idx = np.where(fold_val_labels == 0)[0]
+            val_min_count = min(len(pos_val_idx), len(neg_val_idx))
+            
+            pos_val_sampled = rng.choice(pos_val_idx, val_min_count, replace=False)
+            neg_val_sampled = rng.choice(neg_val_idx, val_min_count, replace=False)
+            balanced_val_idx = np.concatenate([pos_val_sampled, neg_val_sampled])
+            rng.shuffle(balanced_val_idx)
+            
+            fold_val_compounds = [fold_val_compounds[i] for i in balanced_val_idx]
+            fold_val_proteins = fold_val_proteins[balanced_val_idx]
+            fold_val_labels = fold_val_labels[balanced_val_idx]
+
+        # 打印各 Fold 真实参与训练和验证的样本分布
+        print(f"  - [Final Balanced] Train Set Size: {len(fold_train_labels)} (Pos: {int(np.sum(fold_train_labels==1))}, Neg: {int(np.sum(fold_train_labels==0))})")
+        print(f"  - [Final Balanced] Val Set Size:   {len(fold_val_labels)} (Pos: {int(np.sum(fold_val_labels==1))}, Neg: {int(np.sum(fold_val_labels==0))})")
         
         train_dataset = ORLigandDataset(
-            train_compounds, train_proteins, train_labels,
+            fold_train_compounds, fold_train_proteins, fold_train_labels,
             protein_tokenizer, config.protein_max_len
         )
         
         val_dataset = ORLigandDataset(
-            val_compounds, val_proteins, val_labels,
+            fold_val_compounds, fold_val_proteins, fold_val_labels,
             protein_tokenizer, config.protein_max_len
         )
         
@@ -191,6 +300,7 @@ def main():
         
         best_auc = 0
         best_model_state = None
+        best_acc, best_f1, best_recall, best_mcc = 0, 0, 0, 0
         
         for epoch in range(config.num_epochs):
             train_loss = train_model(model, train_loader, criterion, optimizer, device)
@@ -239,8 +349,29 @@ def main():
     
     print("\nTraining final model on entire dataset...")
     
+    # 最终模型训练的数据平衡
+    final_compounds = compound_graphs
+    final_proteins = proteins
+    final_labels = labels
+    
+    if args.balance_samples:
+        pos_idx = np.where(labels == 1)[0]
+        neg_idx = np.where(labels == 0)[0]
+        min_count = min(len(pos_idx), len(neg_idx))
+        
+        rng = np.random.default_rng(42)
+        pos_sampled = rng.choice(pos_idx, min_count, replace=False)
+        neg_sampled = rng.choice(neg_idx, min_count, replace=False)
+        balanced_idx = np.concatenate([pos_sampled, neg_sampled])
+        rng.shuffle(balanced_idx)
+        
+        final_compounds = [compound_graphs[i] for i in balanced_idx]
+        final_proteins = final_proteins[balanced_idx]
+        final_labels = final_labels[balanced_idx]
+        print(f"Final Model Dataset Balanced to {len(final_labels)} samples (Pos: {min_count}, Neg: {min_count}).")
+    
     full_dataset = ORLigandDataset(
-        compound_graphs, proteins, labels,
+        final_compounds, final_proteins, final_labels,
         protein_tokenizer, config.protein_max_len
     )
     

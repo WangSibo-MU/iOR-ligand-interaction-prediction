@@ -34,8 +34,17 @@ warnings.filterwarnings('ignore')
 TASK = 'validate'  # 'validate' or 'predict'
 PREDICTION_FILE = 'test.txt'  # Prediction task input file
 OUTPUT_FILE = 'predictions.txt'  # Prediction result output file
-LOCAL_SAMPLE_INDICES = [608, 609, 610]  # Manually specify the sample index for local interpretation (starting from 0)
+LOCAL_SAMPLE_INDICES = [0, 1, 2, 3]  # Manually specify the sample index for local interpretation (starting from 0)
 GLOBAL_EXPLANATION = True  # Whether to generate a global explanation
+
+# The existing local code applied sigmoid before displaying predictions, so the
+# default assumes CPIPredictor returns raw logits. Set False only if its forward
+# method already returns probabilities.
+MODEL_OUTPUT_IS_LOGIT = True
+
+# 'object' asks GNNExplainer for one scalar mask per node. The aggregation helper
+# below also supports older 'attributes' masks if this option is changed.
+GNN_NODE_MASK_TYPE = 'object'  # 'object' or 'attributes'
 # =====================================================
 
 # RANDOM_SEED
@@ -53,6 +62,28 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 config = Config()
+
+def output_to_probability_tensor(output):
+    """Convert CPIPredictor output to probabilities consistently everywhere."""
+    if not torch.is_tensor(output):
+        output = torch.as_tensor(output, dtype=torch.float32, device=device)
+    return torch.sigmoid(output) if MODEL_OUTPUT_IS_LOGIT else output
+
+
+def safe_minmax(values):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return arr
+    finite = np.isfinite(arr)
+    if not finite.all():
+        replacement = float(np.nanmedian(arr[finite])) if finite.any() else 0.0
+        arr = np.where(finite, arr, replacement)
+    vmin = float(arr.min())
+    vmax = float(arr.max())
+    if np.isclose(vmax, vmin):
+        return np.zeros_like(arr)
+    return (arr - vmin) / (vmax - vmin)
+
 
 atom_dict = defaultdict(lambda: len(atom_dict))
 fingerprint_dict = defaultdict(lambda: len(fingerprint_dict))
@@ -206,19 +237,228 @@ class CPIPredictorWrapper(nn.Module):
         return self.model(compound_data, protein_data)
 
 # ============== GNNExplainer ==============
-def gnn_explainer_local_explanation(model, test_loader, sample_indices, mol_objects, device, protein_vocab_size, node_in_dim):
+def aggregate_node_mask(node_mask, num_atoms):
+    """Aggregate an Explainer node mask to one score per real RDKit atom."""
+    if node_mask is None:
+        return np.zeros(num_atoms, dtype=np.float64), np.array([], dtype=np.float64), None
+    raw = node_mask.detach().cpu().numpy()
+    feature_level = raw.copy() if raw.ndim > 1 and raw.shape[-1] > 1 else None
+    if raw.ndim == 1:
+        per_node = raw
+    else:
+        # Reduce feature dimensions but never flatten nodes and features together.
+        per_node = raw.mean(axis=tuple(range(1, raw.ndim)))
+    per_node = np.asarray(per_node, dtype=np.float64).reshape(-1)
+    real = per_node[:num_atoms]
+    padded = per_node[num_atoms:]
+    return real, padded, feature_level
+
+
+def aggregate_bond_mask(edge_mask, edge_index, mol):
+    """Map directed PyG edges to undirected RDKit bonds.
+
+    The training-compatible padded edges remain in the model and in the
+    explanation optimization. They are excluded only from chemical-bond drawing
+    and are reported separately as unmapped/padded edge diagnostics.
+    """
+    if edge_mask is None:
+        return np.zeros(mol.GetNumBonds(), dtype=np.float64), np.array([], dtype=np.float64), []
+
+    scores = np.asarray(edge_mask.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+    edges = np.asarray(edge_index.detach().cpu().numpy(), dtype=np.int64)
+    if edges.ndim != 2 or edges.shape[0] != 2:
+        raise ValueError(f"Unexpected edge_index shape: {edges.shape}")
+    usable = min(scores.size, edges.shape[1])
+    scores = scores[:usable]
+    edges = edges[:, :usable]
+
+    used_indices = set()
+    bond_scores = []
+    bond_edge_indices = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        matches = np.where(
+            ((edges[0] == i) & (edges[1] == j)) |
+            ((edges[0] == j) & (edges[1] == i))
+        )[0]
+        matches = matches.tolist()
+        used_indices.update(matches)
+        bond_edge_indices.append(matches)
+        bond_scores.append(float(scores[matches].mean()) if matches else 0.0)
+
+    unmapped_indices = [idx for idx in range(usable) if idx not in used_indices]
+    unmapped_scores = scores[unmapped_indices] if unmapped_indices else np.array([], dtype=np.float64)
+    return np.asarray(bond_scores, dtype=np.float64), unmapped_scores, bond_edge_indices
+
+
+def save_feature_importance_csv(mol, node_mask, edge_mask, edge_index,
+                                sample_idx, actual_label, pred_prob):
+    try:
+        num_atoms = mol.GetNumAtoms()
+        atom_raw, padded_node_raw, feature_level = aggregate_node_mask(node_mask, num_atoms)
+        atom_relative = safe_minmax(atom_raw)
+
+        atom_rows = []
+        for atom in mol.GetAtoms():
+            idx = atom.GetIdx()
+            atom_rows.append({
+                'Atom_Index': idx,
+                'Atom_Type': atom.GetSymbol(),
+                'Degree': atom.GetDegree(),
+                'Formal_Charge': atom.GetFormalCharge(),
+                'Is_Aromatic': atom.GetIsAromatic(),
+                'Hybridization': str(atom.GetHybridization()),
+                'Raw_Importance_Score': float(atom_raw[idx]),
+                'Relative_Importance_Score': float(atom_relative[idx]),
+            })
+        atom_path = os.path.join(RESULTS_DIR, f'sample_{sample_idx}_atom_importance.csv')
+        pd.DataFrame(atom_rows).to_csv(atom_path, index=False)
+
+        # Preserve feature-level masks when node_mask_type='attributes'.
+        if feature_level is not None:
+            rows = []
+            for atom_idx in range(min(num_atoms, feature_level.shape[0])):
+                flattened = np.asarray(feature_level[atom_idx]).reshape(-1)
+                for feature_idx, score in enumerate(flattened):
+                    rows.append({
+                        'Atom_Index': atom_idx,
+                        'Feature_Index': feature_idx,
+                        'Mask_Score': float(score),
+                    })
+            pd.DataFrame(rows).to_csv(
+                os.path.join(RESULTS_DIR, f'sample_{sample_idx}_node_feature_mask.csv'),
+                index=False,
+            )
+
+        bond_raw, unmapped_edge_raw, bond_edge_indices = aggregate_bond_mask(
+            edge_mask, edge_index, mol
+        )
+        bond_relative = safe_minmax(bond_raw)
+        bond_rows = []
+        for bond in mol.GetBonds():
+            idx = bond.GetIdx()
+            bond_rows.append({
+                'Bond_Index': idx,
+                'Begin_Atom_Index': bond.GetBeginAtomIdx(),
+                'Begin_Atom_Type': bond.GetBeginAtom().GetSymbol(),
+                'End_Atom_Index': bond.GetEndAtomIdx(),
+                'End_Atom_Type': bond.GetEndAtom().GetSymbol(),
+                'Bond_Type': str(bond.GetBondType()),
+                'Is_In_Ring': bond.IsInRing(),
+                'Is_Conjugated': bond.GetIsConjugated(),
+                'Stereo': str(bond.GetStereo()),
+                'Directed_Edge_Indices': ','.join(map(str, bond_edge_indices[idx])),
+                'Raw_Importance_Score': float(bond_raw[idx]),
+                'Relative_Importance_Score': float(bond_relative[idx]),
+            })
+        pd.DataFrame(bond_rows).to_csv(
+            os.path.join(RESULTS_DIR, f'sample_{sample_idx}_bond_importance.csv'),
+            index=False,
+        )
+
+        diagnostics_path = os.path.join(
+            RESULTS_DIR, f'sample_{sample_idx}_explanation_diagnostics.txt'
+        )
+        with open(diagnostics_path, 'w', encoding='utf-8') as handle:
+            handle.write(f"Sample index: {sample_idx}\n")
+            handle.write(f"Actual label: {actual_label}\n")
+            handle.write(f"Predicted probability: {pred_prob:.8f}\n")
+            handle.write(f"Real atom count: {num_atoms}\n")
+            handle.write(f"Real bond count: {mol.GetNumBonds()}\n")
+            handle.write(f"Node mask type: {GNN_NODE_MASK_TYPE}\n")
+            handle.write(f"Padded node count in mask: {padded_node_raw.size}\n")
+            handle.write(
+                f"Padded node mask mean/max: "
+                f"{float(padded_node_raw.mean()) if padded_node_raw.size else 0.0:.8f}/"
+                f"{float(padded_node_raw.max()) if padded_node_raw.size else 0.0:.8f}\n"
+            )
+            handle.write(f"Unmapped/padded edge count: {unmapped_edge_raw.size}\n")
+            handle.write(
+                f"Unmapped/padded edge mask mean/max: "
+                f"{float(unmapped_edge_raw.mean()) if unmapped_edge_raw.size else 0.0:.8f}/"
+                f"{float(unmapped_edge_raw.max()) if unmapped_edge_raw.size else 0.0:.8f}\n"
+            )
+            handle.write(
+                f"Real bond mask mean/max: "
+                f"{float(bond_raw.mean()) if bond_raw.size else 0.0:.8f}/"
+                f"{float(bond_raw.max()) if bond_raw.size else 0.0:.8f}\n"
+            )
+        print(f"Atom/bond importance and padding diagnostics saved for sample {sample_idx}")
+    except Exception as exc:
+        print(f"Error saving feature importance: {exc}")
+        import traceback
+        traceback.print_exc()
+
+
+def visualize_molecule_explanation(mol, node_mask, edge_mask, edge_index,
+                                   sample_idx, actual_label, pred_prob):
+    try:
+        atom_raw, _, _ = aggregate_node_mask(node_mask, mol.GetNumAtoms())
+        bond_raw, _, _ = aggregate_bond_mask(edge_mask, edge_index, mol)
+        atom_relative = safe_minmax(atom_raw)
+        bond_relative = safe_minmax(bond_raw)
+
+        cmap = plt.get_cmap('Reds')
+        highlight_atoms = list(range(mol.GetNumAtoms()))
+        highlight_atom_colors = {
+            idx: tuple(float(c) for c in cmap(float(atom_relative[idx])))
+            for idx in highlight_atoms
+        }
+        highlight_bonds = list(range(mol.GetNumBonds()))
+        highlight_bond_colors = {
+            idx: tuple(float(c) for c in cmap(float(bond_relative[idx])))
+            for idx in highlight_bonds
+        }
+
+        drawer = MolDraw2DCairo(1000, 1000)
+        drawer.SetFontSize(12)
+        drawer.DrawMolecule(
+            mol,
+            highlightAtoms=highlight_atoms,
+            highlightAtomColors=highlight_atom_colors,
+            highlightBonds=highlight_bonds,
+            highlightBondColors=highlight_bond_colors,
+        )
+        drawer.FinishDrawing()
+        img = Image.open(io.BytesIO(drawer.GetDrawingText()))
+
+        fig, (ax_img, ax_cbar) = plt.subplots(
+            1, 2, figsize=(12, 10), gridspec_kw={'width_ratios': [5, 1]}
+        )
+        ax_img.imshow(img)
+        ax_img.axis('off')
+        ax_img.set_title(
+            f'Sample {sample_idx}\nActual: {actual_label}, Predicted probability: {pred_prob:.4f}',
+            fontsize=17,
+        )
+        norm = plt.Normalize(0.0, 1.0)
+        sm = plt.cm.ScalarMappable(cmap='Reds', norm=norm)
+        sm.set_array([])
+        cbar = plt.colorbar(sm, cax=ax_cbar)
+        cbar.set_label('Relative GNNExplainer importance (0-1)', fontsize=14)
+        plt.tight_layout()
+        output_path = os.path.join(RESULTS_DIR, f'gnnexplainer_sample_{sample_idx}.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"GNNExplainer visualization saved to {output_path}")
+    except Exception as exc:
+        print(f"Error visualizing molecule explanation: {exc}")
+        import traceback
+        traceback.print_exc()
+
+
+def gnn_explainer_local_explanation(model, test_loader, sample_indices, mol_objects,
+                                    device, protein_vocab_size, node_in_dim):
     print("\nPerforming GNNExplainer-based local explanation...")
-    
     try:
         wrapped_model = CPIPredictorWrapper(
             config=config,
             protein_vocab_size=protein_vocab_size,
-            node_in_dim=node_in_dim
+            node_in_dim=node_in_dim,
         ).to(device)
-        
         wrapped_model.model.load_state_dict(model.state_dict())
         wrapped_model.eval()
-        
+
         explainer = Explainer(
             model=wrapped_model,
             algorithm=GNNExplainer(epochs=200),
@@ -226,213 +466,69 @@ def gnn_explainer_local_explanation(model, test_loader, sample_indices, mol_obje
             model_config=dict(
                 mode='binary_classification',
                 task_level='graph',
-                return_type='raw',
+                return_type='raw' if MODEL_OUTPUT_IS_LOGIT else 'probs',
             ),
-            node_mask_type='attributes',
+            node_mask_type=GNN_NODE_MASK_TYPE,
             edge_mask_type='object',
         )
-        
-        all_data = []
-        all_proteins = []
-        all_labels = []
-        
+
+        all_data, all_proteins, all_labels = [], [], []
         for compound_data, protein, labels in test_loader:
             all_data.append(compound_data)
             all_proteins.append(protein)
             all_labels.extend(labels.cpu().numpy())
-        
-        all_data = Batch.from_data_list([d for batch in all_data for d in batch.to_data_list()])
+        all_data = Batch.from_data_list(
+            [d for batch in all_data for d in batch.to_data_list()]
+        )
         all_proteins = torch.cat(all_proteins, dim=0)
-        
-        for idx in sample_indices:
-            print(f"\nAnalyzing sample {idx}...")
 
-            data_sample = all_data.get_example(idx)
-            protein_sample = all_proteins[idx:idx+1]
+        for idx in sample_indices:
+            if idx >= len(mol_objects) or idx >= all_data.num_graphs:
+                print(f"Skipping out-of-range sample index {idx}")
+                continue
+            print(f"\nAnalyzing sample {idx}...")
+            data_sample = all_data.get_example(idx).to(device)
+            protein_sample = all_proteins[idx:idx + 1].to(device)
             mol = mol_objects[idx]
-            
             if mol is None:
                 print(f"Skipping sample {idx} due to invalid molecule")
                 continue
-            
             actual_label = int(all_labels[idx])
-
-            data_sample = data_sample.to(device)
-            protein_sample = protein_sample.to(device)
 
             with torch.no_grad():
                 wrapped_model._protein_data = protein_sample
-                pred = wrapped_model(data_sample.x, data_sample.edge_index, 
-                                   edge_attr=data_sample.edge_attr, 
-                                   batch=data_sample.batch if hasattr(data_sample, 'batch') else None,
-                                   protein_data=protein_sample)
-                pred_prob = torch.sigmoid(pred).item()
+                raw_output = wrapped_model(
+                    data_sample.x,
+                    data_sample.edge_index,
+                    edge_attr=data_sample.edge_attr,
+                    batch=data_sample.batch if hasattr(data_sample, 'batch') else None,
+                    protein_data=protein_sample,
+                )
+                pred_prob = float(
+                    output_to_probability_tensor(raw_output).reshape(-1)[0].item()
+                )
 
+            wrapped_model._protein_data = protein_sample
             explanation = explainer(
                 x=data_sample.x,
                 edge_index=data_sample.edge_index,
                 edge_attr=data_sample.edge_attr,
                 batch=data_sample.batch if hasattr(data_sample, 'batch') else None,
-                target=None
+                target=None,
             )
-            
-            node_mask = explanation.node_mask
-            edge_mask = explanation.edge_mask
 
-            visualize_molecule_explanation(mol, node_mask, edge_mask, idx, actual_label, pred_prob)
-
-            save_feature_importance_csv(mol, node_mask, edge_mask, idx, actual_label, pred_prob)
-            
+            visualize_molecule_explanation(
+                mol, explanation.node_mask, explanation.edge_mask,
+                data_sample.edge_index, idx, actual_label, pred_prob,
+            )
+            save_feature_importance_csv(
+                mol, explanation.node_mask, explanation.edge_mask,
+                data_sample.edge_index, idx, actual_label, pred_prob,
+            )
             print(f"GNNExplainer explanation for sample {idx} saved.")
-        
         print("\nGNNExplainer-based local explanation completed.")
-        
-    except Exception as e:
-        print(f"Error in GNNExplainer-based local explanation: {str(e)}")
-        import traceback
-        traceback.print_exc()
-
-def save_feature_importance_csv(mol, node_mask, edge_mask, sample_idx, actual_label, pred_prob):
-    try:
-        node_importance = node_mask.cpu().numpy()
-        if node_importance.size == 0:
-            print(f"No node importance values for sample {sample_idx}")
-            return
-
-        if node_importance.ndim > 1:
-            node_importance = node_importance.flatten()
-
-        node_importance = (node_importance - node_importance.min()) / (node_importance.max() - node_importance.min() + 1e-8)
-
-        atom_data = []
-        for i, atom in enumerate(mol.GetAtoms()):
-            if i < len(node_importance):
-                importance = float(node_importance[i])
-                atom_data.append({
-                    'Atom_Index': i,
-                    'Atom_Type': atom.GetSymbol(),
-                    'Degree': atom.GetDegree(),
-                    'Formal_Charge': atom.GetFormalCharge(),
-                    'Is_Aromatic': atom.GetIsAromatic(),
-                    'Hybridization': str(atom.GetHybridization()),
-                    'Importance_Score': importance
-                })
-        
-        atom_df = pd.DataFrame(atom_data)
-        atom_csv_path = os.path.join(RESULTS_DIR, f'sample_{sample_idx}_atom_importance.csv')
-        atom_df.to_csv(atom_csv_path, index=False)
-        print(f"Atom feature importance saved to {atom_csv_path}")
-        edge_importance = edge_mask.cpu().numpy()
-        if edge_importance.size > 0:
-            if edge_importance.ndim > 1:
-                edge_importance = edge_importance.flatten()
-            edge_importance = (edge_importance - edge_importance.min()) / (edge_importance.max() - edge_importance.min() + 1e-8)
-            bond_data = []
-            for i, bond in enumerate(mol.GetBonds()):
-                if i < len(edge_importance):
-                    importance = float(edge_importance[i])
-                    begin_atom = bond.GetBeginAtom()
-                    end_atom = bond.GetEndAtom()
-                    
-                    bond_data.append({
-                        'Bond_Index': i,
-                        'Begin_Atom_Index': bond.GetBeginAtomIdx(),
-                        'Begin_Atom_Type': begin_atom.GetSymbol(),
-                        'End_Atom_Index': bond.GetEndAtomIdx(),
-                        'End_Atom_Type': end_atom.GetSymbol(),
-                        'Bond_Type': str(bond.GetBondType()),
-                        'Is_In_Ring': bond.IsInRing(),
-                        'Is_Conjugated': bond.GetIsConjugated(),
-                        'Stereo': str(bond.GetStereo()),
-                        'Importance_Score': importance
-                    })
-            bond_df = pd.DataFrame(bond_data)
-            bond_csv_path = os.path.join(RESULTS_DIR, f'sample_{sample_idx}_bond_importance.csv')
-            bond_df.to_csv(bond_csv_path, index=False)
-            print(f"Bond feature importance saved to {bond_csv_path}")
-            
-    except Exception as e:
-        print(f"Error saving feature importance to CSV: {str(e)}")
-        import traceback
-        traceback.print_exc()
-
-def visualize_molecule_explanation(mol, node_mask, edge_mask, sample_idx, actual_label, pred_prob):
-    try:
-        node_importance = node_mask.cpu().numpy()
-        if node_importance.size == 0:
-            print(f"No node importance values for sample {sample_idx}")
-            return
-        if node_importance.ndim > 1:
-            node_importance = node_importance.flatten()
-            
-        node_importance = (node_importance - node_importance.min()) / (node_importance.max() - node_importance.min() + 1e-8)
-        cmap = plt.get_cmap('Reds')
-        atom_colors = {}
-        for i, importance in enumerate(node_importance):
-            if i < len(node_importance):
-                importance_float = float(importance)
-                atom_colors[i] = tuple(float(c) for c in cmap(importance_float))
-        
-        # Drawing molecules
-        drawer = MolDraw2DCairo(1000, 1000)
-        drawer.SetFontSize(12)  # Font size
-        highlight_atoms = []
-        highlight_colors = {}
-        for i, atom in enumerate(mol.GetAtoms()):
-            if i < len(node_importance):
-                highlight_atoms.append(i)
-                highlight_colors[i] = atom_colors[i]
-        highlight_bonds = []
-        bond_colors = {}
-        edge_importance = edge_mask.cpu().numpy()
-        if edge_importance.size > 0:
-            if edge_importance.ndim > 1:
-                edge_importance = edge_importance.flatten()
-                
-            edge_importance = (edge_importance - edge_importance.min()) / (edge_importance.max() - edge_importance.min() + 1e-8)
-            
-            for i, bond in enumerate(mol.GetBonds()):
-                if i < len(edge_importance):
-                    highlight_bonds.append(i)
-                    edge_importance_float = float(edge_importance[i])
-                    bond_colors[i] = tuple(float(c) for c in cmap(edge_importance_float))
-        drawer.DrawMolecule(
-            mol,
-            highlightAtoms=highlight_atoms,
-            highlightAtomColors=highlight_colors,
-            highlightBonds=highlight_bonds,
-            highlightBondColors=bond_colors,
-        )
-        
-        drawer.FinishDrawing()
-        
-        png_data = drawer.GetDrawingText()
-        
-        img = Image.open(io.BytesIO(png_data))
-        
-        fig, (ax_img, ax_cbar) = plt.subplots(1, 2, figsize=(12, 10), 
-                                             gridspec_kw={'width_ratios': [5, 1]})
-        
-        ax_img.imshow(img)
-        ax_img.axis('off')
-        ax_img.set_title(f'Sample {sample_idx}\nActual: {actual_label}, Predicted: {pred_prob:.4f}', fontsize=17)
-        
-        norm = plt.Normalize(0, 1)
-        sm = plt.cm.ScalarMappable(cmap='Reds', norm=norm)
-        sm.set_array([])
-        
-        cbar = plt.colorbar(sm, cax=ax_cbar)
-        cbar.set_label('Importance Score', fontsize=15)
-        cbar.ax.tick_params(labelsize=10)
-        
-        plt.tight_layout()
-        
-        plt.savefig(os.path.join(RESULTS_DIR, f'gnnexplainer_sample_{sample_idx}.png'), 
-                   dpi=300, bbox_inches='tight')
-        plt.close()
-            
-    except Exception as e:
-        print(f"Error visualizing molecule explanation: {str(e)}")
+    except Exception as exc:
+        print(f"Error in GNNExplainer-based local explanation: {exc}")
         import traceback
         traceback.print_exc()
 
@@ -553,7 +649,7 @@ def extract_compound_features(model, data_loader, device):
 def visualize_compound_features(features, labels):
     """t-SNE"""
     try:
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=300, n_jobs=1)
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=300, n_jobs=1)
         features_2d = tsne.fit_transform(features)
 
         plt.figure(figsize=(10, 8))
@@ -750,11 +846,12 @@ def evaluate_model(model, data_loader, device):
             labels = labels.float().to(device)
             
             outputs = model(compound_data, protein)
+            probabilities = output_to_probability_tensor(outputs)
 
-            if outputs.dim() == 0:
-                batch_preds = [outputs.item()]
+            if probabilities.dim() == 0:
+                batch_preds = [probabilities.item()]
             else:
-                batch_preds = outputs.cpu().numpy().tolist()
+                batch_preds = probabilities.detach().cpu().numpy().tolist()
 
             predictions.extend(batch_preds)
             true_labels.extend(labels.cpu().numpy())
@@ -876,7 +973,7 @@ def main():
         test_labels = []
         
         try:
-            with open('processed_data/test.txt', 'r') as f:
+            with open('processed_data/external_validation.txt', 'r') as f:
                 for line in f:
                     parts = line.strip().split('\t')
                     if len(parts) < 3:
@@ -1058,12 +1155,12 @@ def main():
                 compound_data = compound_data.to(device)
                 protein = protein.to(device)
                 outputs = model(compound_data, protein)
-                
+                probabilities = output_to_probability_tensor(outputs)
 
-                if outputs.dim() == 0:
-                    batch_preds = [outputs.item()]
+                if probabilities.dim() == 0:
+                    batch_preds = [probabilities.item()]
                 else:
-                    batch_preds = outputs.cpu().numpy().tolist()
+                    batch_preds = probabilities.detach().cpu().numpy().tolist()
                 
                 predictions.extend(batch_preds)
 
